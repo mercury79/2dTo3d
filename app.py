@@ -31,14 +31,22 @@ except Exception:
     _SPLAT_OK = False
 
 
+try:
+    from lama_inpaint import is_available as _lama_available
+    _LAMA_OK = _lama_available()
+except Exception:
+    _LAMA_OK = False
+
+
 def build_stereo(img, depth, max_disparity, swap_eyes, use_splat,
-                 convergence=0.5, gamma=1.0):
+                 convergence=0.5, gamma=1.0, inpaint=False):
     """Route to GPU splatting or CPU column warp."""
     if use_splat and _SPLAT_OK:
         try:
             return build_sbs_splat(img, depth, max_disparity=max_disparity,
                                    swap_eyes=swap_eyes,
-                                   convergence=convergence, gamma=gamma)
+                                   convergence=convergence, gamma=gamma,
+                                   inpaint=inpaint and _LAMA_OK)
         except Exception:
             pass
     return build_sbs(img, depth, max_disparity=max_disparity,
@@ -186,6 +194,15 @@ class App(_BaseTk):
         if not _SPLAT_OK:
             cb.configure(state=tk.DISABLED)
 
+        self.lama_var = tk.BooleanVar(value=_LAMA_OK)
+        cb2 = tk.Checkbutton(ctrl, text="Relleno IA (LaMa)",
+                             variable=self.lama_var,
+                             bg=BG, fg=FG, selectcolor="#313244",
+                             activebackground=BG, activeforeground=FG)
+        cb2.pack(side=tk.LEFT, padx=(8, 0))
+        if not _LAMA_OK:
+            cb2.configure(state=tk.DISABLED)
+
         # ── monitor selector ──────────────────────────────────────────────────
         ctrl2 = tk.Frame(self, bg=BG)
         ctrl2.pack(fill=tk.X, padx=PAD, pady=(2, 0))
@@ -247,7 +264,8 @@ class App(_BaseTk):
                                swap_eyes=self.swap_var.get(),
                                use_splat=self.splat_var.get(),
                                convergence=1.0 - self.conv_var.get() / 100.0,
-                               gamma=self.gamma_var.get() / 100.0)
+                               gamma=self.gamma_var.get() / 100.0,
+                               inpaint=self.lama_var.get())
             sbs.save(out, quality=95)
             self.status_var.set(f"Guardado: {out}")
 
@@ -289,6 +307,7 @@ class App(_BaseTk):
             splat=self.splat_var.get(),
             convergence=1.0 - self.conv_var.get() / 100.0,
             gamma=self.gamma_var.get() / 100.0,
+            inpaint=self.lama_var.get(),
         )
         # When the viewer closes (ESC), pull back its final settings
         threading.Thread(target=self._wait_viewer_sync,
@@ -471,7 +490,7 @@ _tmp_sbs_path: str | None = None
 def _launch_exclusive_viewer(img: Image.Image, depth, monitor_idx: int = 0,
                              disparity: int = 40, swap: bool = False,
                              splat: bool = False, convergence: float = 0.5,
-                             gamma: float = 1.0, src_path: str = ""):
+                             gamma: float = 1.0, inpaint: bool = False):
     """
     Save the original image + depth map to temp files and launch viewer.py.
     The viewer builds the SBS itself, so disparity can be adjusted live
@@ -487,7 +506,8 @@ def _launch_exclusive_viewer(img: Image.Image, depth, monitor_idx: int = 0,
     return subprocess.Popen(
         [sys.executable, _VIEWER_SCRIPT, tmp_img, tmp_depth,
          str(monitor_idx), str(disparity), str(int(swap)), str(int(splat)),
-         str(round(convergence * 100)), str(round(gamma * 100))],
+         str(round(convergence * 100)), str(round(gamma * 100)),
+         str(int(inpaint))],
         cwd=os.path.dirname(os.path.abspath(__file__)),
         creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
     )

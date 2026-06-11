@@ -101,9 +101,23 @@ def build_sbs_splat(
     swap_eyes: bool = False,
     convergence: float = 0.5,
     gamma: float = 1.0,
+    inpaint: bool = False,
 ) -> Image.Image:
-    """Drop-in replacement for stereo_builder.build_sbs using GPU splatting."""
+    """
+    Drop-in replacement for stereo_builder.build_sbs using GPU splatting.
+    inpaint=True fills dis-occlusion holes with LaMa (slower, best quality);
+    otherwise holes are filled laterally from the background side.
+    """
     torch, device = _init()
+
+    lama = None
+    if inpaint:
+        try:
+            import lama_inpaint
+            if lama_inpaint.is_available():
+                lama = lama_inpaint
+        except Exception:
+            lama = None
 
     arr = torch.from_numpy(
         np.array(img.convert("RGB"), dtype=np.float32)
@@ -126,8 +140,16 @@ def build_sbs_splat(
     eyes = []
     for sign in (-1.0, 1.0):                # left eye, right eye
         out, out_d, valid = _splat_eye(arr, d, sign * half, torch, device)
-        out = _fill_holes(out, out_d, valid, torch, device)
-        eyes.append(out.clamp(0, 255).byte().cpu().numpy())
+        if lama is not None:
+            # dilate hole mask 2px so LaMa also repairs splat edge fringes
+            hole = (~valid).float()[None, None]
+            hole = torch.nn.functional.max_pool2d(hole, 5, stride=1, padding=2)
+            hole_np = hole[0, 0].bool().cpu().numpy()
+            eye_np = out.clamp(0, 255).byte().cpu().numpy()
+            eyes.append(lama.inpaint(eye_np, hole_np))
+        else:
+            out = _fill_holes(out, out_d, valid, torch, device)
+            eyes.append(out.clamp(0, 255).byte().cpu().numpy())
 
     left, right = eyes
     if swap_eyes:

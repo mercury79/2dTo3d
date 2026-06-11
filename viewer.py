@@ -71,6 +71,7 @@ def main():
     use_splat = bool(int(sys.argv[6])) if len(sys.argv) > 6 else False
     convergence = (int(sys.argv[7]) / 100.0) if len(sys.argv) > 7 else 0.5
     gamma = (int(sys.argv[8]) / 100.0) if len(sys.argv) > 8 else 1.0
+    use_inpaint = bool(int(sys.argv[9])) if len(sys.argv) > 9 else False
 
     set_dpi_aware()
     ox, oy = get_monitor_offset(monitor_idx)
@@ -133,9 +134,11 @@ def main():
 
     def render_frame(disp: int, swap: bool, conv: float, fast: bool = False) -> bytes:
         if use_splat:
+            # LaMa inpainting only on the final (slow) pass, not while dragging
             sbs = build_sbs_splat(state["canvas"], state["depth"],
                                   max_disparity=disp, swap_eyes=swap,
-                                  convergence=conv, gamma=gamma)
+                                  convergence=conv, gamma=gamma,
+                                  inpaint=use_inpaint and not fast)
         elif fast:
             sbs = build_sbs(state["canvas_half"], state["depth_half"],
                             max_disparity=disp // 2, swap_eyes=swap,
