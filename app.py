@@ -23,6 +23,24 @@ except ImportError:
 from depth_estimator import estimate_depth
 from stereo_builder import build_sbs
 
+try:
+    from splat_renderer import build_sbs_splat, is_available as _splat_available
+    _SPLAT_OK = _splat_available()
+except Exception:
+    _SPLAT_OK = False
+
+
+def build_stereo(img, depth, max_disparity, swap_eyes, use_splat):
+    """Route to GPU splatting or CPU column warp."""
+    if use_splat and _SPLAT_OK:
+        try:
+            return build_sbs_splat(img, depth, max_disparity=max_disparity,
+                                   swap_eyes=swap_eyes)
+        except Exception:
+            pass
+    return build_sbs(img, depth, max_disparity=max_disparity,
+                     swap_eyes=swap_eyes)
+
 SUPPORTED = (
     ("Imágenes", "*.jpg *.jpeg *.png *.bmp *.webp *.tiff *.heic"),
     ("Todos los archivos", "*.*"),
@@ -42,12 +60,12 @@ def _fit(img: Image.Image, max_w: int, max_h: int) -> Image.Image:
     return img
 
 
-def _process(path: str, disparity: int, swap: bool, use_ml: bool, cb_done, cb_err):
+def _process(path: str, use_ml: bool, cb_done, cb_err):
+    """Heavy stage: load image + estimate depth (once per image/ML toggle)."""
     try:
         img = Image.open(path).convert("RGB")
         depth = estimate_depth(img, use_ml=use_ml)
-        sbs = build_sbs(img, depth, max_disparity=disparity, swap_eyes=swap)
-        cb_done(sbs, img, depth)
+        cb_done(img, depth)
         if use_ml:
             import depth_estimator
             if depth_estimator.last_ml_error:
@@ -59,13 +77,33 @@ def _process(path: str, disparity: int, swap: bool, use_ml: bool, cb_done, cb_er
 
 # ── main window ────────────────────────────────────────────────────────────────
 
-class App(tk.Tk):
+try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+    _BaseTk = TkinterDnD.Tk
+    _DND_OK = True
+except ImportError:
+    _BaseTk = tk.Tk
+    _DND_OK = False
+
+
+class App(_BaseTk):
     def __init__(self):
         super().__init__()
         self.title("2D → 3D SBS Converter")
         self.resizable(True, True)
         self.configure(bg="#1e1e2e")
         self._build_ui()
+        if _DND_OK:
+            self.drop_target_register(DND_FILES)
+            self.dnd_bind("<<Drop>>", self._on_drop)
+
+    def _on_drop(self, event):
+        # event.data: paths, brace-wrapped when they contain spaces
+        raw = event.data.strip()
+        path = raw[1:].split("}")[0] if raw.startswith("{") else raw.split()[0]
+        if os.path.isfile(path):
+            self._img_path = path
+            self._rebuild()
 
     # ── UI ────────────────────────────────────────────────────────────────────
 
@@ -93,12 +131,14 @@ class App(tk.Tk):
         ctrl = tk.Frame(self, bg=BG)
         ctrl.pack(fill=tk.X, padx=PAD, pady=(PAD // 2, 0))
 
-        tk.Label(ctrl, text="Disparidad:", bg=BG, fg=FG).pack(side=tk.LEFT)
+        tk.Label(ctrl, text="Disparidad 3D:", bg=BG, fg="#f9e2af",
+                 font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT)
         self.disp_var = tk.IntVar(value=28)
         self.disp_slider = tk.Scale(
-            ctrl, from_=5, to=80, orient=tk.HORIZONTAL, variable=self.disp_var,
-            length=200, bg=BG, fg=FG, troughcolor="#313244",
-            highlightthickness=0, command=self._on_slider,
+            ctrl, from_=0, to=100, orient=tk.HORIZONTAL, variable=self.disp_var,
+            length=320, width=18, bg=BG, fg="#f9e2af", troughcolor="#45475a",
+            highlightthickness=0, font=("Segoe UI", 10, "bold"),
+            command=self._on_slider,
         )
         self.disp_slider.pack(side=tk.LEFT, padx=(4, 16))
 
@@ -112,7 +152,17 @@ class App(tk.Tk):
         tk.Checkbutton(ctrl, text="Usar Depth Anything (ML)", variable=self.ml_var,
                        bg=BG, fg=FG, selectcolor="#313244",
                        activebackground=BG, activeforeground=FG,
-                       command=self._on_slider).pack(side=tk.LEFT)
+                       command=self._rebuild).pack(side=tk.LEFT)
+
+        self.splat_var = tk.BooleanVar(value=_SPLAT_OK)
+        cb = tk.Checkbutton(ctrl, text="Splatting GPU (sin ghosting)",
+                            variable=self.splat_var,
+                            bg=BG, fg=FG, selectcolor="#313244",
+                            activebackground=BG, activeforeground=FG,
+                            command=self._on_slider)
+        cb.pack(side=tk.LEFT, padx=(16, 0))
+        if not _SPLAT_OK:
+            cb.configure(state=tk.DISABLED)
 
         # ── monitor selector ──────────────────────────────────────────────────
         ctrl2 = tk.Frame(self, bg=BG)
@@ -148,6 +198,8 @@ class App(tk.Tk):
         self._img_path: str | None = None
         self._photo_ref = None     # keep-alive for preview PhotoImage
         self._slider_pending = None
+        self._preview_img = None   # downscaled image for real-time preview
+        self._preview_depth = None
 
     # ── actions ───────────────────────────────────────────────────────────────
 
@@ -158,8 +210,8 @@ class App(tk.Tk):
             self._rebuild()
 
     def _save(self):
-        if current_sbs is None:
-            messagebox.showinfo("Aviso", "Primero genera una imagen SBS.")
+        if current_img is None or current_depth is None:
+            messagebox.showinfo("Aviso", "Primero abre una imagen.")
             return
         out = filedialog.asksaveasfilename(
             defaultextension=".jpg",
@@ -167,7 +219,12 @@ class App(tk.Tk):
             initialfile="sbs_3d.jpg",
         )
         if out:
-            current_sbs.save(out, quality=95)
+            # Build full-resolution SBS with the current settings
+            sbs = build_stereo(current_img, current_depth,
+                               max_disparity=self.disp_var.get(),
+                               swap_eyes=self.swap_var.get(),
+                               use_splat=self.splat_var.get())
+            sbs.save(out, quality=95)
             self.status_var.set(f"Guardado: {out}")
 
     def _refresh_monitors(self):
@@ -197,62 +254,117 @@ class App(tk.Tk):
             messagebox.showinfo("Aviso", "Primero genera una imagen SBS.")
             return
         idx = self.monitor_combo.current()
-        # Disparity is in display pixels at 3840-wide — scale the slider value
+        # Disparity is in display pixels at 3840-wide — scale the slider value.
+        # Cap the starting value at 30 so the 3D opens comfortable, not aggressive.
         disp_scaled = round(self.disp_var.get() * ODYSSEY_3D_W / (2 * current_img.width))
-        _launch_exclusive_viewer(
+        proc = _launch_exclusive_viewer(
             current_img, current_depth,
             monitor_idx=idx,
-            disparity=max(4, disp_scaled),
+            disparity=min(30, max(4, disp_scaled)),
             swap=self.swap_var.get(),
+            splat=self.splat_var.get(),
         )
+        # When the viewer closes (ESC), pull back its final settings
+        threading.Thread(target=self._wait_viewer_sync,
+                         args=(proc,), daemon=True).start()
+
+    def _wait_viewer_sync(self, proc):
+        import json
+        try:
+            proc.wait()
+            result_path = os.path.join(tempfile.gettempdir(),
+                                       "odyssey_result_tmp.json")
+            if not os.path.exists(result_path):
+                return
+            with open(result_path) as f:
+                result = json.load(f)
+            os.remove(result_path)
+            # viewer disparity is in 3840-display pixels → back to image pixels
+            disp_app = round(result["disparity"] * 2 * current_img.width
+                             / ODYSSEY_3D_W)
+            disp_app = max(0, min(100, disp_app))
+
+            def apply():
+                self.disp_var.set(disp_app)
+                self.swap_var.set(bool(result.get("swap", False)))
+                self._refresh_sbs_preview()
+                self.status_var.set(
+                    f"Ajustes del visor 3D aplicados: disparidad {disp_app}")
+            self.after(0, apply)
+        except Exception:
+            pass
 
     def _on_slider(self, *_):
+        # Real-time: only re-warp the cached preview (no depth recompute).
+        if self._preview_img is None:
+            return
         if self._slider_pending:
             self.after_cancel(self._slider_pending)
-        self._slider_pending = self.after(400, self._rebuild)
+        self._slider_pending = self.after(15, self._refresh_sbs_preview)
 
     def _rebuild(self):
+        """Heavy path: re-estimate depth (new image or ML toggle)."""
         if not self._img_path:
             return
         self._set_busy(True)
         threading.Thread(
             target=_process,
-            args=(
-                self._img_path,
-                self.disp_var.get(),
-                self.swap_var.get(),
-                self.ml_var.get(),
-                self._on_done,
-                self._on_err,
-            ),
+            args=(self._img_path, self.ml_var.get(),
+                  self._on_done, self._on_err),
             daemon=True,
         ).start()
 
-    def _on_done(self, sbs: Image.Image, img: Image.Image, depth):
-        global current_sbs, current_img, current_depth
-        current_sbs = sbs
+    def _on_done(self, img: Image.Image, depth):
+        global current_img, current_depth
         current_img = img
         current_depth = depth
-        self.after(0, self._update_preview, sbs)
+        self.after(0, self._prepare_preview)
 
-    def _on_err(self, msg: str):
-        self.after(0, lambda: (self._set_busy(False),
-                                self.status_var.set(f"Error: {msg}")))
+    def _prepare_preview(self):
+        """Build downscaled copies once; slider then re-warps them instantly."""
+        import numpy as np
+        img, depth = current_img, current_depth
 
-    def _update_preview(self, sbs: Image.Image):
+        pw = 1000
+        scale = min(1.0, pw / img.width)
+        nw, nh = round(img.width * scale), round(img.height * scale)
+        self._preview_img = img.resize((nw, nh), Image.LANCZOS)
+        self._preview_depth = np.array(
+            Image.fromarray((depth * 255).astype(np.uint8), mode="L")
+            .resize((nw, nh), Image.BILINEAR), dtype=np.float32) / 255.0
+
         self._set_busy(False)
+        self._refresh_sbs_preview()
+
+    def _refresh_sbs_preview(self):
+        """Fast re-warp of the preview pair — runs on every slider tick."""
+        if self._preview_img is None:
+            return
+        # Slider is calibrated for full-res; scale down for the preview copy
+        disp = round(self.disp_var.get() * self._preview_img.width
+                     / max(1, current_img.width))
+        sbs = build_stereo(self._preview_img, self._preview_depth,
+                           max_disparity=max(1, disp),
+                           swap_eyes=self.swap_var.get(),
+                           use_splat=self.splat_var.get())
+
         cw = self.canvas.winfo_width() or 900
         ch = self.canvas.winfo_height() or 400
-        preview = sbs.copy()
-        preview.thumbnail((cw, ch), Image.LANCZOS)
+        preview = sbs
+        if sbs.width > cw or sbs.height > ch:
+            preview = sbs.copy()
+            preview.thumbnail((cw, ch), Image.LANCZOS)
         self._photo_ref = ImageTk.PhotoImage(preview)
         self.canvas.configure(image=self._photo_ref)
         name = os.path.basename(self._img_path)
         self.status_var.set(
-            f"{name}  →  SBS {sbs.width}×{sbs.height}   "
-            f"[disparidad {self.disp_var.get()}px]   "
-            f"Clic en la imagen o ⛶ para pantalla completa"
+            f"{name}   [disparidad {self.disp_var.get()}]   "
+            f"Clic en la imagen o ⛶ para verla en 3D"
         )
+
+    def _on_err(self, msg: str):
+        self.after(0, lambda: (self._set_busy(False),
+                                self.status_var.set(f"Error: {msg}")))
 
     def _set_busy(self, busy: bool):
         if busy:
@@ -274,7 +386,8 @@ _tmp_sbs_path: str | None = None
 
 
 def _launch_exclusive_viewer(img: Image.Image, depth, monitor_idx: int = 0,
-                             disparity: int = 40, swap: bool = False):
+                             disparity: int = 40, swap: bool = False,
+                             splat: bool = False):
     """
     Save the original image + depth map to temp files and launch viewer.py.
     The viewer builds the SBS itself, so disparity can be adjusted live
@@ -287,9 +400,9 @@ def _launch_exclusive_viewer(img: Image.Image, depth, monitor_idx: int = 0,
     img.save(tmp_img, format="PNG")
     np.save(tmp_depth, depth)
 
-    subprocess.Popen(
+    return subprocess.Popen(
         [sys.executable, _VIEWER_SCRIPT, tmp_img, tmp_depth,
-         str(monitor_idx), str(disparity), str(int(swap))],
+         str(monitor_idx), str(disparity), str(int(swap)), str(int(splat))],
         cwd=os.path.dirname(os.path.abspath(__file__)),
         creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
     )
