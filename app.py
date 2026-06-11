@@ -128,93 +128,85 @@ class App(_BaseTk):
                "activeforeground": FG, "relief": tk.FLAT, "padx": 10, "pady": 6,
                "cursor": "hand2"}
 
-        # ── top bar ───────────────────────────────────────────────────────────
+        F_LBL = ("Segoe UI", 13, "bold")
+        F_CHK = ("Segoe UI", 12)
+        F_BTN = ("Segoe UI", 12, "bold")
+        BTN = {**BTN, "font": F_BTN, "padx": 16, "pady": 8}
+
+        # ── row 1: buttons ────────────────────────────────────────────────────
         top = tk.Frame(self, bg=BG)
         top.pack(fill=tk.X, padx=PAD, pady=(PAD, 0))
 
         tk.Button(top, text="📂  Abrir imagen", command=self._open, **BTN).pack(side=tk.LEFT)
-        tk.Button(top, text="💾  Guardar SBS", command=self._save, **BTN).pack(side=tk.LEFT, padx=6)
-        tk.Button(top, text="⛶  Pantalla completa", command=self._fullscreen,
+        tk.Button(top, text="💾  Guardar SBS", command=self._save, **BTN).pack(side=tk.LEFT, padx=8)
+        tk.Button(top, text="⛶  Pantalla completa 3D", command=self._fullscreen,
                   bg="#a6e3a1", fg="#1e1e2e", activebackground="#94e2d5",
-                  activeforeground="#1e1e2e", relief=tk.FLAT, padx=10, pady=6,
-                  cursor="hand2").pack(side=tk.LEFT)
+                  activeforeground="#1e1e2e", relief=tk.FLAT, padx=16, pady=8,
+                  font=F_BTN, cursor="hand2").pack(side=tk.LEFT)
 
-        # ── controls ──────────────────────────────────────────────────────────
+        # ── row 2: sliders (grid so they stretch with the window) ────────────
         ctrl = tk.Frame(self, bg=BG)
         ctrl.pack(fill=tk.X, padx=PAD, pady=(PAD // 2, 0))
+        ctrl.columnconfigure(1, weight=3)
+        ctrl.columnconfigure(3, weight=2)
+        ctrl.columnconfigure(5, weight=2)
 
-        tk.Label(ctrl, text="Disparidad 3D:", bg=BG, fg="#f9e2af",
-                 font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT)
+        def make_slider(col, text, color, var, vfrom, vto):
+            tk.Label(ctrl, text=text, bg=BG, fg=color, font=F_LBL) \
+                .grid(row=0, column=col, sticky="sw", padx=(0, 6), pady=(0, 8))
+            s = tk.Scale(ctrl, from_=vfrom, to=vto, orient=tk.HORIZONTAL,
+                         variable=var, width=22, bg=BG, fg=color,
+                         troughcolor="#45475a", highlightthickness=0,
+                         font=("Segoe UI", 12, "bold"),
+                         command=self._on_slider)
+            s.grid(row=0, column=col + 1, sticky="ew", padx=(0, 18))
+            return s
+
         self.disp_var = tk.IntVar(value=28)
-        self.disp_slider = tk.Scale(
-            ctrl, from_=0, to=100, orient=tk.HORIZONTAL, variable=self.disp_var,
-            length=320, width=18, bg=BG, fg="#f9e2af", troughcolor="#45475a",
-            highlightthickness=0, font=("Segoe UI", 10, "bold"),
-            command=self._on_slider,
-        )
-        self.disp_slider.pack(side=tk.LEFT, padx=(4, 16))
-
-        tk.Label(ctrl, text="Pop-out:", bg=BG, fg="#a6e3a1",
-                 font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT)
+        self.disp_slider = make_slider(0, "Disparidad 3D:", "#f9e2af",
+                                       self.disp_var, 0, 100)
         self.conv_var = tk.IntVar(value=50)
-        tk.Scale(ctrl, from_=0, to=100, orient=tk.HORIZONTAL,
-                 variable=self.conv_var, length=160, width=14,
-                 bg=BG, fg="#a6e3a1", troughcolor="#45475a",
-                 highlightthickness=0, command=self._on_slider,
-                 ).pack(side=tk.LEFT, padx=(4, 12))
-
-        tk.Label(ctrl, text="Curva:", bg=BG, fg="#cba6f7",
-                 font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT)
+        make_slider(2, "Pop-out:", "#a6e3a1", self.conv_var, 0, 100)
         self.gamma_var = tk.IntVar(value=140)   # gamma ×100: 1.40 default
-        tk.Scale(ctrl, from_=50, to=250, orient=tk.HORIZONTAL,
-                 variable=self.gamma_var, length=160, width=14,
-                 bg=BG, fg="#cba6f7", troughcolor="#45475a",
-                 highlightthickness=0, command=self._on_slider,
-                 ).pack(side=tk.LEFT, padx=(4, 12))
+        make_slider(4, "Curva:", "#cba6f7", self.gamma_var, 50, 250)
+
+        # ── row 3: processing options ─────────────────────────────────────────
+        opts = tk.Frame(self, bg=BG)
+        opts.pack(fill=tk.X, padx=PAD, pady=(4, 0))
+
+        def make_check(text, var, command=None, enabled=True):
+            c = tk.Checkbutton(opts, text=text, variable=var, font=F_CHK,
+                               bg=BG, fg=FG, selectcolor="#313244",
+                               activebackground=BG, activeforeground=FG,
+                               command=command)
+            c.pack(side=tk.LEFT, padx=(0, 18))
+            if not enabled:
+                c.configure(state=tk.DISABLED)
+            return c
 
         self.swap_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(ctrl, text="Invertir ojos (R/L)", variable=self.swap_var,
-                       bg=BG, fg=FG, selectcolor="#313244",
-                       activebackground=BG, activeforeground=FG,
-                       command=self._on_slider).pack(side=tk.LEFT, padx=(0, 16))
-
+        make_check("Invertir ojos (R/L)", self.swap_var, self._on_slider)
         self.ml_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(ctrl, text="Usar Depth Anything (ML)", variable=self.ml_var,
-                       bg=BG, fg=FG, selectcolor="#313244",
-                       activebackground=BG, activeforeground=FG,
-                       command=self._rebuild).pack(side=tk.LEFT)
-
+        make_check("Depth Anything (IA)", self.ml_var, self._rebuild)
         self.splat_var = tk.BooleanVar(value=_SPLAT_OK)
-        cb = tk.Checkbutton(ctrl, text="Splatting GPU (sin ghosting)",
-                            variable=self.splat_var,
-                            bg=BG, fg=FG, selectcolor="#313244",
-                            activebackground=BG, activeforeground=FG,
-                            command=self._on_slider)
-        cb.pack(side=tk.LEFT, padx=(16, 0))
-        if not _SPLAT_OK:
-            cb.configure(state=tk.DISABLED)
-
+        make_check("Splatting GPU", self.splat_var, self._on_slider, _SPLAT_OK)
         self.lama_var = tk.BooleanVar(value=_LAMA_OK)
-        cb2 = tk.Checkbutton(ctrl, text="Relleno IA (LaMa)",
-                             variable=self.lama_var,
-                             bg=BG, fg=FG, selectcolor="#313244",
-                             activebackground=BG, activeforeground=FG)
-        cb2.pack(side=tk.LEFT, padx=(8, 0))
-        if not _LAMA_OK:
-            cb2.configure(state=tk.DISABLED)
+        make_check("Relleno IA (LaMa)", self.lama_var, None, _LAMA_OK)
 
         # ── monitor selector ──────────────────────────────────────────────────
         ctrl2 = tk.Frame(self, bg=BG)
         ctrl2.pack(fill=tk.X, padx=PAD, pady=(2, 0))
 
-        tk.Label(ctrl2, text="Monitor Odyssey 3D:", bg=BG, fg=FG).pack(side=tk.LEFT)
+        tk.Label(ctrl2, text="Monitor Odyssey 3D:", bg=BG, fg=FG,
+                 font=F_CHK).pack(side=tk.LEFT)
         self.monitor_var = tk.StringVar()
         self.monitor_combo = ttk.Combobox(ctrl2, textvariable=self.monitor_var,
-                                          state="readonly", width=36)
-        self.monitor_combo.pack(side=tk.LEFT, padx=(4, 0))
+                                          state="readonly", width=40,
+                                          font=F_CHK)
+        self.monitor_combo.pack(side=tk.LEFT, padx=(6, 0))
         tk.Button(ctrl2, text="↺", command=self._refresh_monitors,
-                  bg="#313244", fg=FG, relief=tk.FLAT, padx=6, pady=2,
-                  cursor="hand2").pack(side=tk.LEFT, padx=4)
+                  bg="#313244", fg=FG, relief=tk.FLAT, padx=10, pady=4,
+                  font=F_CHK, cursor="hand2").pack(side=tk.LEFT, padx=6)
         self._refresh_monitors()
 
         # ── preview area ──────────────────────────────────────────────────────
@@ -231,7 +223,8 @@ class App(_BaseTk):
         # ── progress bar ──────────────────────────────────────────────────────
         self.progress = ttk.Progressbar(self, mode="indeterminate")
 
-        self.geometry("960x560")
+        self.geometry("1280x760")
+        self.minsize(900, 600)
 
         # internal state
         self._img_path: str | None = None
@@ -239,6 +232,8 @@ class App(_BaseTk):
         self._slider_pending = None
         self._preview_img = None   # downscaled image for real-time preview
         self._preview_depth = None
+        self._depth_cache = {}     # (path, ml) → (img, depth); gallery prefetch
+        self._depth_lock = threading.Lock()  # serialize model inference
 
     # ── actions ───────────────────────────────────────────────────────────────
 
@@ -252,10 +247,13 @@ class App(_BaseTk):
         if current_img is None or current_depth is None:
             messagebox.showinfo("Aviso", "Primero abre una imagen.")
             return
+        base = os.path.splitext(os.path.basename(self._img_path))[0] \
+            if self._img_path else "imagen"
         out = filedialog.asksaveasfilename(
             defaultextension=".jpg",
             filetypes=[("JPEG", "*.jpg"), ("PNG", "*.png")],
-            initialfile="sbs_3d.jpg",
+            initialfile=f"{base}_SBS.jpg",
+            initialdir=os.path.dirname(self._img_path) if self._img_path else None,
         )
         if out:
             # Build full-resolution SBS with the current settings
@@ -324,6 +322,32 @@ class App(_BaseTk):
         )
         return files
 
+    def _depth_for(self, path: str):
+        """Image + depth with caching (gallery prefetch hits this)."""
+        key = (path, self.ml_var.get())
+        if key in self._depth_cache:
+            return self._depth_cache[key]
+        img = Image.open(path).convert("RGB")
+        with self._depth_lock:
+            if key in self._depth_cache:        # raced with prefetch
+                return self._depth_cache[key]
+            depth = estimate_depth(img, use_ml=self.ml_var.get())
+        # keep the cache small
+        if len(self._depth_cache) > 6:
+            self._depth_cache.pop(next(iter(self._depth_cache)))
+        self._depth_cache[key] = (img, depth)
+        return img, depth
+
+    def _prefetch_neighbors(self, files, i):
+        """Warm the cache for prev/next so arrow keys feel instant."""
+        def work():
+            for j in (i + 1, i - 1):
+                try:
+                    self._depth_for(files[j % len(files)])
+                except Exception:
+                    pass
+        threading.Thread(target=work, daemon=True).start()
+
     def _handle_nav(self, direction: int, seq: int):
         """Viewer asked for prev/next image: compute depth, hand it over."""
         import json
@@ -331,14 +355,14 @@ class App(_BaseTk):
         global current_img, current_depth
 
         files = self._gallery_files()
-        try:
-            i = files.index(os.path.abspath(self._img_path))
-        except ValueError:
-            i = 0
-        new_path = files[(i + direction) % len(files)]
+        cur = os.path.normcase(os.path.normpath(os.path.abspath(self._img_path)))
+        i = next((k for k, f in enumerate(files)
+                  if os.path.normcase(os.path.normpath(os.path.abspath(f))) == cur), 0)
+        new_i = (i + direction) % len(files)
+        new_path = files[new_i]
 
-        img = Image.open(new_path).convert("RGB")
-        depth = estimate_depth(img, use_ml=self.ml_var.get())
+        img, depth = self._depth_for(new_path)
+        self._prefetch_neighbors(files, new_i)
 
         tmp_img = os.path.join(tempfile.gettempdir(), "odyssey_src_tmp.png")
         tmp_depth = os.path.join(tempfile.gettempdir(), "odyssey_depth_tmp.npy")
@@ -435,6 +459,16 @@ class App(_BaseTk):
 
         self._set_busy(False)
         self._refresh_sbs_preview()
+
+        # warm the gallery cache for prev/next
+        try:
+            files = self._gallery_files()
+            cur = os.path.normcase(os.path.normpath(os.path.abspath(self._img_path)))
+            i = next((k for k, f in enumerate(files)
+                      if os.path.normcase(os.path.normpath(os.path.abspath(f))) == cur), 0)
+            self._prefetch_neighbors(files, i)
+        except Exception:
+            pass
 
     def _refresh_sbs_preview(self):
         """Fast re-warp of the preview pair — runs on every slider tick."""
