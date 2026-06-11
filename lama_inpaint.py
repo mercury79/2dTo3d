@@ -60,5 +60,6 @@ def inpaint(image: np.ndarray, mask: np.ndarray) -> np.ndarray:
     with torch.inference_mode():
         out = model(img_t, mask_t)
 
-    result = out[0].permute(1, 2, 0)[:H, :W].clamp(0, 255)
+    # model output is normalized 0..1 → scale back to 0..255
+    result = (out[0].permute(1, 2, 0)[:H, :W] * 255.0).clamp(0, 255)
     return result.byte().cpu().numpy()
