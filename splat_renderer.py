@@ -99,6 +99,8 @@ def build_sbs_splat(
     depth: np.ndarray,
     max_disparity: int = 30,
     swap_eyes: bool = False,
+    convergence: float = 0.5,
+    gamma: float = 1.0,
 ) -> Image.Image:
     """Drop-in replacement for stereo_builder.build_sbs using GPU splatting."""
     torch, device = _init()
@@ -117,7 +119,9 @@ def build_sbs_splat(
     else:
         d = d.to(device)
 
-    half = (d - 0.5) * float(max_disparity)
+    if abs(gamma - 1.0) > 1e-3:
+        d = d.clamp(0.0, 1.0).pow(gamma)
+    half = (d - float(convergence)) * float(max_disparity)
 
     eyes = []
     for sign in (-1.0, 1.0):                # left eye, right eye

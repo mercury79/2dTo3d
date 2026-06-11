@@ -35,17 +35,33 @@ def warp_image(arr: np.ndarray, shift_map: np.ndarray) -> np.ndarray:
     return warped
 
 
+def apply_depth_curve(depth: np.ndarray, gamma: float) -> np.ndarray:
+    """
+    Non-linear depth remap. gamma > 1 expands separation between the
+    foreground subject and the mid-ground while compressing the far
+    background — closer to how human stereo perception works.
+    """
+    if abs(gamma - 1.0) < 1e-3:
+        return depth
+    return np.power(depth.clip(0.0, 1.0), gamma).astype(np.float32)
+
+
 def build_sbs(
     img: Image.Image,
     depth: np.ndarray,
     max_disparity: int = 30,
     swap_eyes: bool = False,
+    convergence: float = 0.5,
+    gamma: float = 1.0,
 ) -> Image.Image:
     """
     Returns a Side-By-Side stereo image (left|right).
 
-    max_disparity: maximum horizontal pixel shift (controls 3D depth intensity).
-    swap_eyes: set True if your display needs right-left order instead of left-right.
+    max_disparity: maximum horizontal pixel shift (3D intensity).
+    convergence:   depth value [0..1] that sits exactly AT the screen plane.
+                   Lower → more of the scene pops out; higher → sinks behind.
+    gamma:         non-linear depth curve (see apply_depth_curve).
+    swap_eyes:     True if your display needs right-left order.
     """
     arr = np.array(img.convert("RGB"), dtype=np.float32)
     h, w = arr.shape[:2]
@@ -54,11 +70,11 @@ def build_sbs(
     depth_resized = np.array(
         Image.fromarray(depth).resize((w, h), Image.BILINEAR)
     )
+    depth_resized = apply_depth_curve(depth_resized, gamma)
 
-    # Convergence plane at mid-depth: nearer-than-median pops OUT of the
-    # screen, farther sinks INTO it. Without this everything shifts one
-    # way and the 3D feels flat/uncomfortable.
-    half_disp = ((depth_resized - 0.5) * max_disparity).astype(np.float32)
+    # Convergence plane: depth == convergence renders at the screen plane;
+    # nearer pops OUT of the screen, farther sinks INTO it.
+    half_disp = ((depth_resized - convergence) * max_disparity).astype(np.float32)
 
     # left eye  → shift right  (+half)
     # right eye → shift left   (-half)

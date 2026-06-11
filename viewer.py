@@ -1,26 +1,39 @@
 """
-SBS viewer for Samsung Odyssey 3D — hybrid exclusive mode + live disparity.
+SBS viewer for Samsung Odyssey 3D — exclusive fullscreen, live controls.
 
 Usage:
-    python viewer.py <image.png> <depth.npy> <monitor_idx> <disparity> <swap:0|1>
+    python viewer.py <image.png> <depth.npy> [monitor] [disparity] [swap]
+                     [splat] [convergence*100] [gamma*100]
 
-Phase 1: exclusive fullscreen (3840x2160) → triggers Odyssey 3D Hub detection.
-Phase 2: if surface is lost during the Hub's mode switch, re-open exclusive.
+Controls:
+    Rueda del mouse / ↑ ↓     disparidad (intensidad 3D)
+    Slider flotante 1         disparidad
+    Slider flotante 2         pop-out (plano de convergencia)
+    ← →                       imagen anterior / siguiente (galería)
+    S                         invertir ojos
+    ESC                       cerrar (sincroniza ajustes con la app)
 
-Live controls:
-    Rueda del mouse / ↑ ↓   ajustar disparidad (intensidad 3D)
-    S                       invertir ojos
-    ESC                     cerrar
+Gallery protocol (viewer ↔ app, via temp files):
+    viewer writes odyssey_nav_request.json {"seq": n, "dir": ±1}
+    app re-computes depth for the next image, overwrites the tmp image/depth
+    files and writes odyssey_ready.json {"seq": n, "name": "..."}
+    viewer sees the matching seq and reloads.
 """
 import sys
 import os
+import json
 import time
 import ctypes
+import tempfile
 
 import numpy as np
 
 TARGET_W, TARGET_H = 3840, 2160
 OVERLAY_SECONDS = 2.0
+
+NAV_REQUEST = os.path.join(tempfile.gettempdir(), "odyssey_nav_request.json")
+NAV_READY = os.path.join(tempfile.gettempdir(), "odyssey_ready.json")
+RESULT_FILE = os.path.join(tempfile.gettempdir(), "odyssey_result_tmp.json")
 
 
 def set_dpi_aware():
@@ -46,7 +59,8 @@ def get_monitor_offset(monitor_idx: int):
 
 def main():
     if len(sys.argv) < 3:
-        print("Usage: viewer.py <image> <depth.npy> [monitor] [disparity] [swap]")
+        print("Usage: viewer.py <image> <depth.npy> [monitor] [disparity] "
+              "[swap] [splat] [conv*100] [gamma*100]")
         sys.exit(1)
 
     img_path = sys.argv[1]
@@ -55,11 +69,20 @@ def main():
     disparity = int(sys.argv[4]) if len(sys.argv) > 4 else 40
     swap_eyes = bool(int(sys.argv[5])) if len(sys.argv) > 5 else False
     use_splat = bool(int(sys.argv[6])) if len(sys.argv) > 6 else False
+    convergence = (int(sys.argv[7]) / 100.0) if len(sys.argv) > 7 else 0.5
+    gamma = (int(sys.argv[8]) / 100.0) if len(sys.argv) > 8 else 1.0
 
     set_dpi_aware()
     ox, oy = get_monitor_offset(monitor_idx)
     os.environ["SDL_VIDEO_WINDOW_POS"] = f"{ox},{oy}"
     os.environ["SDL_VIDEO_MINIMIZE_ON_FOCUS_LOSS"] = "0"
+
+    # clean stale protocol files
+    for p in (NAV_REQUEST, NAV_READY, RESULT_FILE):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
 
     import pygame
     from PIL import Image
@@ -73,46 +96,54 @@ def main():
         except Exception:
             use_splat = False
 
-    # ── prepare letterboxed source (16:9 canvas, aspect preserved) ──────────
-    src = Image.open(img_path).convert("RGB")
-    depth_full = np.load(depth_path)  # float32 [0..1], same size as src
+    # ── source loading (letterbox to 16:9, aspect preserved) ────────────────
+    state = {}
 
-    scale = min(TARGET_W / src.width, TARGET_H / src.height)
-    nw, nh = round(src.width * scale), round(src.height * scale)
-    fitted = src.resize((nw, nh), Image.LANCZOS)
+    def load_source():
+        src = Image.open(img_path).convert("RGB")
+        depth_full = np.load(depth_path)
 
-    canvas = Image.new("RGB", (TARGET_W, TARGET_H), (0, 0, 0))
-    pad_x, pad_y = (TARGET_W - nw) // 2, (TARGET_H - nh) // 2
-    canvas.paste(fitted, (pad_x, pad_y))
+        scale = min(TARGET_W / src.width, TARGET_H / src.height)
+        nw, nh = round(src.width * scale), round(src.height * scale)
+        fitted = src.resize((nw, nh), Image.LANCZOS)
 
-    # depth letterboxed the same way (background = far = 0)
-    depth_img = Image.fromarray((depth_full * 255).astype(np.uint8), mode="L")
-    depth_fitted = depth_img.resize((nw, nh), Image.BILINEAR)
-    depth_canvas = Image.new("L", (TARGET_W, TARGET_H), 0)
-    depth_canvas.paste(depth_fitted, (pad_x, pad_y))
-    depth_lb = np.array(depth_canvas, dtype=np.float32) / 255.0
+        canvas = Image.new("RGB", (TARGET_W, TARGET_H), (0, 0, 0))
+        pad_x, pad_y = (TARGET_W - nw) // 2, (TARGET_H - nh) // 2
+        canvas.paste(fitted, (pad_x, pad_y))
 
-    # Half-res working copies for fast preview while adjusting
-    canvas_half = canvas.resize((TARGET_W // 2, TARGET_H // 2), Image.BILINEAR)
-    depth_half = np.array(
-        Image.fromarray((depth_lb * 255).astype(np.uint8), mode="L")
-        .resize((TARGET_W // 2, TARGET_H // 2), Image.BILINEAR),
-        dtype=np.float32,
-    ) / 255.0
+        depth_img = Image.fromarray((depth_full * 255).astype(np.uint8), mode="L")
+        depth_fitted = depth_img.resize((nw, nh), Image.BILINEAR)
+        depth_canvas = Image.new("L", (TARGET_W, TARGET_H), 0)
+        depth_canvas.paste(depth_fitted, (pad_x, pad_y))
+        depth_lb = np.array(depth_canvas, dtype=np.float32) / 255.0
 
-    def render_frame(disp: int, swap: bool, fast: bool = False) -> bytes:
-        """Build half-SBS frame at TARGET resolution, return raw RGB bytes."""
+        canvas_half = canvas.resize((TARGET_W // 2, TARGET_H // 2), Image.BILINEAR)
+        depth_half = np.array(
+            Image.fromarray((depth_lb * 255).astype(np.uint8), mode="L")
+            .resize((TARGET_W // 2, TARGET_H // 2), Image.BILINEAR),
+            dtype=np.float32,
+        ) / 255.0
+
+        state["canvas"] = canvas
+        state["depth"] = depth_lb
+        state["canvas_half"] = canvas_half
+        state["depth_half"] = depth_half
+
+    load_source()
+
+    def render_frame(disp: int, swap: bool, conv: float, fast: bool = False) -> bytes:
         if use_splat:
-            # GPU splatting is fast enough to always run full-res (~150 ms)
-            sbs = build_sbs_splat(canvas, depth_lb,
-                                  max_disparity=disp, swap_eyes=swap)
+            sbs = build_sbs_splat(state["canvas"], state["depth"],
+                                  max_disparity=disp, swap_eyes=swap,
+                                  convergence=conv, gamma=gamma)
         elif fast:
-            # quarter the pixels → ~4x faster; upscaled for display
-            sbs = build_sbs(canvas_half, depth_half,
-                            max_disparity=disp // 2, swap_eyes=swap)
+            sbs = build_sbs(state["canvas_half"], state["depth_half"],
+                            max_disparity=disp // 2, swap_eyes=swap,
+                            convergence=conv, gamma=gamma)
         else:
-            sbs = build_sbs(canvas, depth_lb, max_disparity=disp, swap_eyes=swap)
-        # full-SBS → squeeze to half-SBS at display size
+            sbs = build_sbs(state["canvas"], state["depth"],
+                            max_disparity=disp, swap_eyes=swap,
+                            convergence=conv, gamma=gamma)
         frame = sbs.resize((TARGET_W, TARGET_H), Image.BILINEAR)
         return frame.tobytes()
 
@@ -120,6 +151,7 @@ def main():
     pygame.init()
     pygame.font.init()
     font = pygame.font.SysFont("Segoe UI", 48, bold=True)
+    font_sm = pygame.font.SysFont("Segoe UI", 34, bold=True)
 
     def open_window():
         pygame.display.quit()
@@ -133,7 +165,7 @@ def main():
         return screen
 
     screen = open_window()
-    raw = render_frame(disparity, swap_eyes)
+    raw = render_frame(disparity, swap_eyes, convergence)
     surf = pygame.image.frombytes(raw, (TARGET_W, TARGET_H), "RGB")
 
     overlay_until = 0.0
@@ -144,25 +176,68 @@ def main():
         overlay_text = text
         overlay_until = time.time() + OVERLAY_SECONDS
 
-    # ── floating slider geometry (per half, so it reads as ONE slider in 3D) ──
+    # ── floating sliders (per half → read as ONE control in 3D) ──────────────
     HALF = TARGET_W // 2
-    SL_W, SL_H = 1100, 14           # track size
-    SL_Y = TARGET_H - 150           # track vertical position
-    SL_X = (HALF - SL_W) // 2       # x within each half
+    SL_W, SL_H = 1100, 14
+    SL_X = (HALF - SL_W) // 2
+    DISP_Y = TARGET_H - 130          # slider 1: disparity
+    CONV_Y = TARGET_H - 240          # slider 2: pop-out
     SL_MAX = 150
-    slider_until = 0.0              # visible while recent mouse activity
-    dragging = False
+    slider_until = 0.0
+    drag_target = None               # None | "disp" | "conv"
 
-    def slider_value_from_x(mx: int) -> int:
-        """Map mouse x (either half) to disparity 0..SL_MAX."""
-        x_in_half = mx % HALF
-        t = (x_in_half - SL_X) / SL_W
-        return max(0, min(SL_MAX, round(t * SL_MAX)))
+    def value_from_x(mx: int, vmax: int) -> int:
+        t = ((mx % HALF) - SL_X) / SL_W
+        return max(0, min(vmax, round(t * vmax)))
 
-    def mouse_on_slider(mx: int, my: int) -> bool:
+    def slider_hit(mx: int, my: int):
         x_in_half = mx % HALF
-        return (SL_X - 40 <= x_in_half <= SL_X + SL_W + 40
-                and SL_Y - 60 <= my <= SL_Y + 60)
+        if not (SL_X - 40 <= x_in_half <= SL_X + SL_W + 40):
+            return None
+        if DISP_Y - 50 <= my <= DISP_Y + 50:
+            return "disp"
+        if CONV_Y - 50 <= my <= CONV_Y + 50:
+            return "conv"
+        return None
+
+    # pop-out as 0..100 (100 = everything pops out → convergence 0)
+    popout = round((1.0 - convergence) * 100)
+
+    # ── gallery state ─────────────────────────────────────────────────────────
+    nav_seq = 0
+    waiting_nav = False
+    nav_started = 0.0
+
+    def request_nav(direction: int):
+        nonlocal nav_seq, waiting_nav, nav_started
+        nav_seq += 1
+        try:
+            with open(NAV_REQUEST, "w") as f:
+                json.dump({"seq": nav_seq, "dir": direction}, f)
+            waiting_nav = True
+            nav_started = time.time()
+            show_overlay("Cargando…")
+        except Exception:
+            pass
+
+    def check_nav_ready():
+        nonlocal waiting_nav
+        if not waiting_nav:
+            return False
+        try:
+            with open(NAV_READY) as f:
+                ready = json.load(f)
+            if ready.get("seq") == nav_seq:
+                load_source()
+                waiting_nav = False
+                show_overlay(ready.get("name", ""))
+                return True
+        except Exception:
+            pass
+        if time.time() - nav_started > 30:
+            waiting_nav = False
+            show_overlay("No se pudo cargar")
+        return False
 
     rebuild_pending = False
     refine_at = None
@@ -175,24 +250,28 @@ def main():
             for event in pygame.event.get():
                 if event.type == pygame.KEYDOWN:
                     if event.key == pygame.K_ESCAPE:
-                        # Persist final settings so the app can sync its slider
                         try:
-                            import json, tempfile
-                            with open(os.path.join(tempfile.gettempdir(),
-                                                   "odyssey_result_tmp.json"),
-                                      "w") as f:
-                                json.dump({"disparity": disparity,
-                                           "swap": swap_eyes}, f)
+                            with open(RESULT_FILE, "w") as f:
+                                json.dump({
+                                    "disparity": disparity,
+                                    "swap": swap_eyes,
+                                    "convergence": 1.0 - popout / 100.0,
+                                    "image": img_path,
+                                }, f)
                         except Exception:
                             pass
                         pygame.quit()
                         return
-                    elif event.key in (pygame.K_UP, pygame.K_RIGHT, pygame.K_PLUS):
+                    elif event.key in (pygame.K_UP, pygame.K_PLUS):
                         disparity = min(SL_MAX, disparity + 4)
                         changed = True
-                    elif event.key in (pygame.K_DOWN, pygame.K_LEFT, pygame.K_MINUS):
+                    elif event.key in (pygame.K_DOWN, pygame.K_MINUS):
                         disparity = max(0, disparity - 4)
                         changed = True
+                    elif event.key == pygame.K_RIGHT:
+                        request_nav(+1)
+                    elif event.key == pygame.K_LEFT:
+                        request_nav(-1)
                     elif event.key == pygame.K_s:
                         swap_eyes = not swap_eyes
                         changed = True
@@ -201,37 +280,42 @@ def main():
                     disparity = max(0, min(SL_MAX, disparity + event.y * 4))
                     changed = True
                 elif event.type == pygame.MOUSEMOTION:
-                    slider_until = time.time() + 3.0   # show slider on move
-                    if dragging:
-                        disparity = slider_value_from_x(event.pos[0])
+                    slider_until = time.time() + 3.0
+                    if drag_target == "disp":
+                        disparity = value_from_x(event.pos[0], SL_MAX)
+                        changed = True
+                    elif drag_target == "conv":
+                        popout = value_from_x(event.pos[0], 100)
                         changed = True
                 elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                    if mouse_on_slider(*event.pos):
-                        dragging = True
-                        disparity = slider_value_from_x(event.pos[0])
+                    drag_target = slider_hit(*event.pos)
+                    if drag_target == "disp":
+                        disparity = value_from_x(event.pos[0], SL_MAX)
+                        changed = True
+                    elif drag_target == "conv":
+                        popout = value_from_x(event.pos[0], 100)
                         changed = True
                 elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
-                    dragging = False
+                    drag_target = None
+
+            if check_nav_ready():
+                changed = True
 
             if changed:
                 last_input = time.time()
                 slider_until = time.time() + 3.0
                 rebuild_pending = True
-                if not overlay_text.startswith("Ojos"):
-                    show_overlay(f"Disparidad: {disparity}")
-                else:
-                    overlay_until = time.time() + OVERLAY_SECONDS
 
-            # Two-stage rebuild: fast half-res preview right away,
-            # full-res refinement once input settles for 0.8s.
             now = time.time()
             if rebuild_pending and now - last_input > 0.1:
-                raw = render_frame(disparity, swap_eyes, fast=True)
+                raw = render_frame(disparity, swap_eyes,
+                                   1.0 - popout / 100.0, fast=True)
                 surf = pygame.image.frombytes(raw, (TARGET_W, TARGET_H), "RGB")
                 rebuild_pending = False
                 refine_at = now + 0.8
             if refine_at and now >= refine_at and not rebuild_pending:
-                raw = render_frame(disparity, swap_eyes, fast=False)
+                raw = render_frame(disparity, swap_eyes,
+                                   1.0 - popout / 100.0, fast=False)
                 surf = pygame.image.frombytes(raw, (TARGET_W, TARGET_H), "RGB")
                 refine_at = None
 
@@ -239,34 +323,30 @@ def main():
 
             now2 = time.time()
 
-            # ── floating slider — drawn on BOTH halves so it reads in 3D ──────
-            if now2 < slider_until or dragging:
-                handle_x = SL_X + round(disparity / SL_MAX * SL_W)
-                label = font.render(f"3D  {disparity}", True, (255, 255, 255))
-                panel_w = SL_W + 120
-                panel = pygame.Surface((panel_w, 110))
+            # ── floating sliders ───────────────────────────────────────────────
+            if now2 < slider_until or drag_target:
+                panel = pygame.Surface((SL_W + 120, 230))
                 panel.set_alpha(170)
                 panel.fill((10, 10, 16))
+                sliders = [
+                    ("3D", disparity, SL_MAX, DISP_Y, (137, 180, 250), font),
+                    ("Pop-out", popout, 100, CONV_Y, (166, 227, 161), font_sm),
+                ]
                 for x_base in (0, HALF):
-                    px = x_base + SL_X - 60
-                    py = SL_Y - 48
-                    screen.blit(panel, (px, py))
-                    # track
-                    pygame.draw.rect(screen, (90, 95, 120),
-                                     (x_base + SL_X, SL_Y, SL_W, SL_H),
-                                     border_radius=7)
-                    # filled portion
-                    pygame.draw.rect(screen, (137, 180, 250),
-                                     (x_base + SL_X, SL_Y,
-                                      handle_x - SL_X, SL_H),
-                                     border_radius=7)
-                    # handle
-                    pygame.draw.circle(screen, (240, 240, 255),
-                                       (x_base + handle_x, SL_Y + SL_H // 2), 26)
-                    # value label above the track
-                    screen.blit(label, (x_base + SL_X, SL_Y - 46))
+                    screen.blit(panel, (x_base + SL_X - 60, CONV_Y - 50))
+                    for name, val, vmax, sy, color, fnt in sliders:
+                        hx = SL_X + round(val / vmax * SL_W)
+                        pygame.draw.rect(screen, (90, 95, 120),
+                                         (x_base + SL_X, sy, SL_W, SL_H),
+                                         border_radius=7)
+                        pygame.draw.rect(screen, color,
+                                         (x_base + SL_X, sy, hx - SL_X, SL_H),
+                                         border_radius=7)
+                        pygame.draw.circle(screen, (240, 240, 255),
+                                           (x_base + hx, sy + SL_H // 2), 24)
+                        lbl = fnt.render(f"{name}  {val}", True, (255, 255, 255))
+                        screen.blit(lbl, (x_base + SL_X, sy - 44))
 
-            # ── text overlay (eye swap notices etc.) ──────────────────────────
             elif now2 < overlay_until and overlay_text:
                 lbl = font.render(overlay_text, True, (255, 255, 255))
                 bg = pygame.Surface((lbl.get_width() + 40, lbl.get_height() + 20))
@@ -282,7 +362,6 @@ def main():
             clock.tick(60)
 
         except pygame.error:
-            # Surface lost during Hub's 3D mode switch — re-open exclusive
             time.sleep(1.5)
             try:
                 screen = open_window()

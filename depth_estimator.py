@@ -113,9 +113,69 @@ def estimate_depth_ml(img: Image.Image):
 last_ml_error: str | None = None
 
 
+def refine_depth_edges(img: Image.Image, depth: np.ndarray) -> np.ndarray:
+    """
+    Joint bilateral filter: smooth the depth map using the IMAGE as guide,
+    so depth edges snap to real color edges (hair, leaves, silhouettes).
+    Runs on GPU if torch+CUDA available; otherwise returns depth unchanged.
+    """
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return depth
+        device = torch.device("cuda")
+
+        H, W = depth.shape
+        # work at <=1536 px wide to bound memory; upsample result after
+        work_w = min(1536, W)
+        work_h = round(H * work_w / W)
+
+        guide = torch.from_numpy(
+            np.array(img.convert("RGB").resize((work_w, work_h), Image.BILINEAR),
+                     dtype=np.float32) / 255.0
+        ).to(device)                                            # (h,w,3)
+        d = torch.nn.functional.interpolate(
+            torch.from_numpy(depth)[None, None].to(device),
+            size=(work_h, work_w), mode="bilinear", align_corners=False,
+        )[0, 0]                                                  # (h,w)
+
+        K = 9                       # kernel size
+        R = K // 2
+        sigma_s = 3.0               # spatial sigma (px)
+        sigma_c = 0.08              # color sigma (0..1 scale)
+
+        guide_p = torch.nn.functional.pad(
+            guide.permute(2, 0, 1)[None], (R, R, R, R), mode="reflect")[0]
+        d_p = torch.nn.functional.pad(
+            d[None, None], (R, R, R, R), mode="reflect")[0, 0]
+
+        num = torch.zeros_like(d)
+        den = torch.zeros_like(d)
+        for dy in range(-R, R + 1):
+            for dx in range(-R, R + 1):
+                w_s = float(np.exp(-(dx * dx + dy * dy) / (2 * sigma_s ** 2)))
+                g_n = guide_p[:, R + dy:R + dy + work_h, R + dx:R + dx + work_w]
+                d_n = d_p[R + dy:R + dy + work_h, R + dx:R + dx + work_w]
+                w_c = torch.exp(
+                    -((g_n - guide.permute(2, 0, 1)) ** 2).sum(0)
+                    / (2 * sigma_c ** 2)
+                )
+                w = w_s * w_c
+                num += w * d_n
+                den += w
+
+        out = num / den.clamp_min(1e-6)
+        out = torch.nn.functional.interpolate(
+            out[None, None], size=(H, W), mode="bilinear", align_corners=False,
+        )[0, 0]
+        return out.clamp(0, 1).cpu().numpy().astype(np.float32)
+    except Exception:
+        return depth
+
+
 def estimate_depth(img: Image.Image, use_ml: bool = False) -> np.ndarray:
     if use_ml:
         ml = estimate_depth_ml(img)
         if ml is not None:
-            return ml
-    return estimate_depth_heuristic(img)
+            return refine_depth_edges(img, ml)
+    return refine_depth_edges(img, estimate_depth_heuristic(img))

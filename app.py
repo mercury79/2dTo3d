@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from PIL import Image, ImageTk
@@ -30,16 +31,19 @@ except Exception:
     _SPLAT_OK = False
 
 
-def build_stereo(img, depth, max_disparity, swap_eyes, use_splat):
+def build_stereo(img, depth, max_disparity, swap_eyes, use_splat,
+                 convergence=0.5, gamma=1.0):
     """Route to GPU splatting or CPU column warp."""
     if use_splat and _SPLAT_OK:
         try:
             return build_sbs_splat(img, depth, max_disparity=max_disparity,
-                                   swap_eyes=swap_eyes)
+                                   swap_eyes=swap_eyes,
+                                   convergence=convergence, gamma=gamma)
         except Exception:
             pass
     return build_sbs(img, depth, max_disparity=max_disparity,
-                     swap_eyes=swap_eyes)
+                     swap_eyes=swap_eyes,
+                     convergence=convergence, gamma=gamma)
 
 SUPPORTED = (
     ("Imágenes", "*.jpg *.jpeg *.png *.bmp *.webp *.tiff *.heic"),
@@ -142,6 +146,24 @@ class App(_BaseTk):
         )
         self.disp_slider.pack(side=tk.LEFT, padx=(4, 16))
 
+        tk.Label(ctrl, text="Pop-out:", bg=BG, fg="#a6e3a1",
+                 font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT)
+        self.conv_var = tk.IntVar(value=50)
+        tk.Scale(ctrl, from_=0, to=100, orient=tk.HORIZONTAL,
+                 variable=self.conv_var, length=160, width=14,
+                 bg=BG, fg="#a6e3a1", troughcolor="#45475a",
+                 highlightthickness=0, command=self._on_slider,
+                 ).pack(side=tk.LEFT, padx=(4, 12))
+
+        tk.Label(ctrl, text="Curva:", bg=BG, fg="#cba6f7",
+                 font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT)
+        self.gamma_var = tk.IntVar(value=140)   # gamma ×100: 1.40 default
+        tk.Scale(ctrl, from_=50, to=250, orient=tk.HORIZONTAL,
+                 variable=self.gamma_var, length=160, width=14,
+                 bg=BG, fg="#cba6f7", troughcolor="#45475a",
+                 highlightthickness=0, command=self._on_slider,
+                 ).pack(side=tk.LEFT, padx=(4, 12))
+
         self.swap_var = tk.BooleanVar(value=False)
         tk.Checkbutton(ctrl, text="Invertir ojos (R/L)", variable=self.swap_var,
                        bg=BG, fg=FG, selectcolor="#313244",
@@ -223,7 +245,9 @@ class App(_BaseTk):
             sbs = build_stereo(current_img, current_depth,
                                max_disparity=self.disp_var.get(),
                                swap_eyes=self.swap_var.get(),
-                               use_splat=self.splat_var.get())
+                               use_splat=self.splat_var.get(),
+                               convergence=1.0 - self.conv_var.get() / 100.0,
+                               gamma=self.gamma_var.get() / 100.0)
             sbs.save(out, quality=95)
             self.status_var.set(f"Guardado: {out}")
 
@@ -263,15 +287,70 @@ class App(_BaseTk):
             disparity=min(30, max(4, disp_scaled)),
             swap=self.swap_var.get(),
             splat=self.splat_var.get(),
+            convergence=1.0 - self.conv_var.get() / 100.0,
+            gamma=self.gamma_var.get() / 100.0,
         )
         # When the viewer closes (ESC), pull back its final settings
         threading.Thread(target=self._wait_viewer_sync,
                          args=(proc,), daemon=True).start()
 
+    _IMG_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff", ".heic", ".heif")
+
+    def _gallery_files(self):
+        """Sorted list of images in the current image's folder."""
+        folder = os.path.dirname(self._img_path)
+        files = sorted(
+            os.path.join(folder, f) for f in os.listdir(folder)
+            if f.lower().endswith(self._IMG_EXTS)
+        )
+        return files
+
+    def _handle_nav(self, direction: int, seq: int):
+        """Viewer asked for prev/next image: compute depth, hand it over."""
+        import json
+        import numpy as np
+        global current_img, current_depth
+
+        files = self._gallery_files()
+        try:
+            i = files.index(os.path.abspath(self._img_path))
+        except ValueError:
+            i = 0
+        new_path = files[(i + direction) % len(files)]
+
+        img = Image.open(new_path).convert("RGB")
+        depth = estimate_depth(img, use_ml=self.ml_var.get())
+
+        tmp_img = os.path.join(tempfile.gettempdir(), "odyssey_src_tmp.png")
+        tmp_depth = os.path.join(tempfile.gettempdir(), "odyssey_depth_tmp.npy")
+        img.save(tmp_img, format="PNG")
+        np.save(tmp_depth, depth)
+        with open(os.path.join(tempfile.gettempdir(), "odyssey_ready.json"), "w") as f:
+            json.dump({"seq": seq, "name": os.path.basename(new_path)}, f)
+
+        # keep the app in sync with what the viewer shows
+        self._img_path = new_path
+        current_img = img
+        current_depth = depth
+        self.after(0, self._prepare_preview)
+
     def _wait_viewer_sync(self, proc):
         import json
+        nav_path = os.path.join(tempfile.gettempdir(), "odyssey_nav_request.json")
+        last_seq = 0
         try:
-            proc.wait()
+            # serve gallery requests while the viewer is open
+            while proc.poll() is None:
+                try:
+                    with open(nav_path) as f:
+                        req = json.load(f)
+                    if req.get("seq", 0) > last_seq:
+                        last_seq = req["seq"]
+                        self._handle_nav(int(req.get("dir", 1)), last_seq)
+                except (OSError, ValueError):
+                    pass
+                time.sleep(0.3)
+
             result_path = os.path.join(tempfile.gettempdir(),
                                        "odyssey_result_tmp.json")
             if not os.path.exists(result_path):
@@ -283,10 +362,12 @@ class App(_BaseTk):
             disp_app = round(result["disparity"] * 2 * current_img.width
                              / ODYSSEY_3D_W)
             disp_app = max(0, min(100, disp_app))
+            conv = float(result.get("convergence", 0.5))
 
             def apply():
                 self.disp_var.set(disp_app)
                 self.swap_var.set(bool(result.get("swap", False)))
+                self.conv_var.set(round((1.0 - conv) * 100))
                 self._refresh_sbs_preview()
                 self.status_var.set(
                     f"Ajustes del visor 3D aplicados: disparidad {disp_app}")
@@ -346,7 +427,9 @@ class App(_BaseTk):
         sbs = build_stereo(self._preview_img, self._preview_depth,
                            max_disparity=max(1, disp),
                            swap_eyes=self.swap_var.get(),
-                           use_splat=self.splat_var.get())
+                           use_splat=self.splat_var.get(),
+                           convergence=1.0 - self.conv_var.get() / 100.0,
+                           gamma=self.gamma_var.get() / 100.0)
 
         cw = self.canvas.winfo_width() or 900
         ch = self.canvas.winfo_height() or 400
@@ -387,7 +470,8 @@ _tmp_sbs_path: str | None = None
 
 def _launch_exclusive_viewer(img: Image.Image, depth, monitor_idx: int = 0,
                              disparity: int = 40, swap: bool = False,
-                             splat: bool = False):
+                             splat: bool = False, convergence: float = 0.5,
+                             gamma: float = 1.0, src_path: str = ""):
     """
     Save the original image + depth map to temp files and launch viewer.py.
     The viewer builds the SBS itself, so disparity can be adjusted live
@@ -402,7 +486,8 @@ def _launch_exclusive_viewer(img: Image.Image, depth, monitor_idx: int = 0,
 
     return subprocess.Popen(
         [sys.executable, _VIEWER_SCRIPT, tmp_img, tmp_depth,
-         str(monitor_idx), str(disparity), str(int(swap)), str(int(splat))],
+         str(monitor_idx), str(disparity), str(int(swap)), str(int(splat)),
+         str(round(convergence * 100)), str(round(gamma * 100))],
         cwd=os.path.dirname(os.path.abspath(__file__)),
         creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
     )
